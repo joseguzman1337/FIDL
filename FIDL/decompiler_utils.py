@@ -12,7 +12,7 @@
 # <carlos.garcia@fireeye.com>
 # ===========================================================================
 
-__version__ = '1.2'
+__version__ = '1.3'
 
 from idc import *
 from idaapi import *
@@ -57,18 +57,8 @@ ida_hexrays.carg_t.__hash__ = _hash_from_obj_id
 
 def debug_get_break_statements(c):
     for n in c.g.nodes():
-        if n.op == cit_if:
-            cex = n.cif.expr
-        elif n.op == cit_return:
-            cex = n.creturn.expr
-        elif n.op == cit_for:
-            cex = n.cfor.expr
-        elif n.op == cit_while:
-            cex = n.cwhile.expr
-        elif n.op == cit_do:
-            cex = n.cdo.expr
-        else:
-            cex = n
+        cex = get_expr(n)
+
         if cex.op == cit_break:
             return [c.ea]
 
@@ -748,17 +738,16 @@ def get_function_vars(c=None, ea=0, only_args=False, only_locals=False):
     # I need to re-order the list of arguments.
     # No idea why, but IDA does not spit the arguments in order.
     # It keeps however a list of how the indexes are messed up in ``c.cf.argidx``
-    ordered_vars = [None] * len(cf.lvars)
 
-    for i, v in enumerate(cf.lvars):
-        if v.is_arg_var:
-            # Need to fix order
-            idx = cf.argidx[i]
-        else:
-            # Local vars seem to be fine
-            idx = i
+    # Only arguments
+    arg_vars = [x for x in c.cf.lvars if x.is_arg_var and x.name]
 
-        ordered_vars[idx] = v
+    # Lvars are in the correct order, args are messed up
+    ordered_vars = list(c.cf.lvars)
+
+    # Second pass reordering "argument elements"
+    for i, j in enumerate(c.cf.argidx):
+        ordered_vars[i] = arg_vars[j]
 
     if only_args:
         return OrderedDict({idx: my_var_t(v) for idx, v in enumerate(ordered_vars)
@@ -1055,6 +1044,13 @@ def value_of_global(ins):
 
 def is_if(ins):
     if ins.op == cit_if:
+        return True
+
+    return False
+
+
+def is_return(ins):
+    if ins.op == cit_return:
         return True
 
     return False
@@ -1426,7 +1422,7 @@ class controlFlowinator:
         # A map of graph nodes and their indexes
         self.index2node = {}
 
-        # Convenient to ve the reverse mapping
+        # Convenient to have the reverse mapping
         self.node2index = {}
 
         # Superblock is the root
@@ -1546,21 +1542,21 @@ class controlFlowinator:
         try:
             succs = list(self.i_cfg.successors(block.index))
             if len(succs) > 1:
-                print("More than one successor!")
-                print("Check this out")
+                dprint("More than one successor!")
+                dprint("Check this out")
 
             if succs:
                 succ = succs[0]
             else:
                 succ = None
         except nx.NetworkXError as e:
-            print("_get_block_successor: {}".format(e))
+            dprint("_get_block_successor: {}".format(e))
             succ = None
 
         if not succ:
-            print("Block: {:#08x}".format(block.ea))
-            print(" succs: {}".format(succs))
-            print(" No successor! Take a look into this!")
+            dprint("Block: {:#08x}".format(block.ea))
+            dprint(" succs: {}".format(succs))
+            dprint(" No successor! Take a look into this!")
 
         return succ
 
@@ -1935,21 +1931,7 @@ class controlFlowinator:
 
         for n in self.g.nodes():
             # Which nodes are prone to contain function calls?
-            if n.op == cit_if:
-                # if(sub_xxx() != v1)
-                cex = n.cif.expr
-            elif n.op == cit_return:
-                # return sub_yyy()
-                cex = n.creturn.expr
-            elif n.op == cit_for:
-                cex = n.cfor.expr
-            elif n.op == cit_while:
-                cex = n.cwhile.expr
-            elif n.op == cit_do:
-                cex = n.cdo.expr
-            else:
-                # asg, call, etc.
-                cex = n
+            cex = get_expr(n)
 
             # This catches nodes that are pure calls
             # ex: sub_xxx(1, 2);
@@ -1971,22 +1953,20 @@ class controlFlowinator:
                     co = callObj(c=self, name=name, node=n, expr=operand)
                     self.calls.append(co)
 
-        if not with_helpers:
-            return
-
-        #
         # Second pass to try to locate helper functions
-        #
+        # and indirect function calls
         for co in self.calls:
-            if co.call_ea == BADADDR:
-                # This may be a helper
-                helperz = find_elements_of_type(co.node, cot_helper)
-                if not helperz or len(helperz) > 1:
-                    continue
+            expr = co.expr
+            if hasattr(expr, 'x') and with_helpers:
+                if is_helper(expr.x):
+                    co.name = expr.x.helper
+                    co.is_helper = True
 
-                h = helperz.pop()
-                co.name = h.helper
-                co.is_helper = True
+            if hasattr(expr, 'x'):
+                if is_var(expr.x):
+                    v_name = ref2var(expr.x, c=self).name or "sub_indirect"
+                    co.name = v_name
+                    co.is_indirect = True
 
     # ================================================================================
     # Debugging utilities
@@ -2125,15 +2105,14 @@ def debug_blownup_expressions(c=None, node=None):
 def create_comment(c=None, ea=0, comment=""):
     """Displays a comment at the line corresponding to ``ea``
 
-    TODO: avoid creating orphan comment in case the mapping
-    from ``ea`` to decompiled code fails
-
     :param c: a :class:`controlFlowinator` object
     :type c: :class:`controlFlowinator`
     :param ea: address for the comment
     :type ea: int
     :param comment: the comment to add
     :type comment: string
+    :return: returns True if comment successfully created
+    :rtype: bool
     """
 
     if not c:
@@ -2148,9 +2127,16 @@ def create_comment(c=None, ea=0, comment=""):
 
     tl = treeloc_t()
     tl.ea = ea
-    tl.itp = ITP_SEMI
-    cf.set_user_cmt(tl, comment)
-    cf.save_user_cmts()
+    #for all cases see https://www.hex-rays.com/products/ida/support/idapython_docs/ida_hexrays-module.html
+    for itp in [ITP_SEMI, ITP_CURLY1, ITP_CURLY2, ITP_COLON, ITP_BRACE1, ITP_BRACE2, ITP_ASM, ITP_ELSE, ITP_DO, ITP_CASE] + list(range(65)):#the range covers ITP_ARG1 to ITP_ARG64 and ITP_EMPTY(0)
+        tl.itp = itp
+        cf.set_user_cmt(tl, comment)
+        cf.save_user_cmts()
+        cf.__str__()#trigger string representation, otherwise orphan comments aren't detected
+        if not cf.has_orphan_cmts():
+            return True
+        cf.del_orphan_cmts()
+    return False
 
 
 # ===========================================================
@@ -2179,9 +2165,11 @@ class callObj:
         self.call_ea = None
         self.ret_type = None
         self.is_helper = False
+        self.is_indirect = False
 
         # Node in our CFG containing the call expr
         self.node = node
+
         # The call expr itself (cot_call)
         self.expr = expr
 
@@ -2190,9 +2178,12 @@ class callObj:
             # being called at location `self.ea`
             self.call_ea = self.expr.x.obj_ea
 
-            # This is the Ea of the `call` instruction
-            # and obviously of the decompiled function call
+            # This is the Ea of the `call` (assembly) instruction
+            # and obviously of the decompiled function call as well
             self.ea = self.expr.ea
+        else:
+            self.call_ea = BADADDR
+            self.ea = BADADDR
 
         self._populate_args()
         self._populate_return_type()
@@ -2200,7 +2191,11 @@ class callObj:
     def _populate_args(self):
         """Performs some arguments preprocessing"""
 
-        self.ida_args = list(self.expr.a)
+        if not self.expr:
+            self.ida_args = []
+        else:
+            self.ida_args = list(self.expr.a)
+
         self.args = {}
 
         Rep = namedtuple('Rep', 'type val')
@@ -2246,11 +2241,34 @@ class callObj:
         print("Target's Name: {}".format(self.name))
         print("Target's Ea: {:X}".format(self.call_ea))
         print("Target's ret: {}".format(self.ret_type))
+        print("Is helper: {}".format(self.is_helper))
+        print("Is indirect: {}".format(self.is_indirect))
         print("Args:")
         for i, arg in self.args.items():
             print(" - {}: {}".format(i, arg))
 
         return ""
+
+
+def get_expr(n):
+    """Returns the corresponding :class:`cexpr_t` in case `n` is
+       of type :class:`cinsn_t`. Idempotent otherwise.
+    """
+
+    if n.op == cit_if:
+        cex = n.cif.expr
+    elif n.op == cit_return:
+        cex = n.creturn.expr
+    elif n.op == cit_for:
+        cex = n.cfor.expr
+    elif n.op == cit_while:
+        cex = n.cwhile.expr
+    elif n.op == cit_do:
+        cex = n.cdo.expr
+    else:
+        cex = n
+
+    return cex
 
 
 def blowup_expression(cex, final_operands=None):
@@ -2344,12 +2362,19 @@ def find_all_calls_to_within(f_name, ea=0, c=None):
 
     call_objs = []
 
+    if ea == 0:
+        # Try to get this from the name
+        ea = get_name_ea_simple(f_name)
+        if ea == BADADDR:
+            dprint(f"Failed to resolve address for {f_name}")
+            return []
+
     if c is None:
         try:
             c = controlFlowinator(ea=ea, fast=False)
         except Exception as e:
-            print("Failed to find_all_calls_to_within {}".format(f_name))
-            print(e)
+            dprint("Failed to find_all_calls_to_within {}".format(f_name))
+            dprint(e)
             return []
 
     for co in c.calls:
@@ -2359,7 +2384,7 @@ def find_all_calls_to_within(f_name, ea=0, c=None):
     return call_objs
 
 
-def find_all_calls_to(f_name):
+def find_all_calls_to(f_name, bruteforce=True):
     """Finds all calls to a function with the given name
 
     Note that the string comparison is relaxed to find variants of it, that is,
@@ -2367,33 +2392,47 @@ def find_all_calls_to(f_name):
 
     :param f_name: the function name to search for
     :type f_name: string
+    :param bruteforce: fallback to bruteforce (search all functions)
+    :type bruteforce: bool, optional
     :return: a list of :class:`callObj`
     :rtype: list
     """
 
+    got_name = True
+
     f_ea = get_name_ea_simple(f_name)
     if f_ea == BADADDR:
-        print("Failed to resolve address for {}".format(f_name))
-        return []
+        dprint("Failed to resolve address for {}".format(f_name))
+        got_name = False
+        if not bruteforce:
+            return []
 
     callz = []
     callers = set()
-    
-    for ref in XrefsTo(f_ea, True):
-        if not ref.iscode:
-            continue
 
-        # Get a set of unique *function* callers
-        f = get_func(ref.frm)
-        if f is None:
-            continue
-            
-        f_ea = f.start_ea
-        callers.add(f_ea)
+    if got_name:
+        for ref in XrefsTo(f_ea, True):
+            if not ref.iscode:
+                continue
 
-    for caller_ea in callers:
-        c = find_all_calls_to_within(f_name, caller_ea)
-        callz += c
+            # Get a set of unique *function* callers
+            f = get_func(ref.frm)
+            if f is None:
+                continue
+                
+            f_ea = f.start_ea
+            callers.add(f_ea)
+
+        for caller_ea in callers:
+            cl = find_all_calls_to_within(f_name, caller_ea)
+            callz += cl
+
+    else:
+        # We fallback to bruteforce
+        dprint("Falling back to bruteforce (search all functions)")
+        for f_ea in NonLibFunctions():
+            cl = find_all_calls_to_within(f_name, f_ea)
+            callz += cl
 
     return callz
 
@@ -2563,15 +2602,25 @@ def does_constrain(node):
 
     constrained_var_idxs = set([])
 
-    # ===========================
-    # Something simple as v1 = 0
-    # or v1 = sub_xxx(y)
-    # ===========================
     if is_asg(node):
         lhs = node.x
         rhs = node.y
 
-        if is_var(lhs) and not is_var(rhs):
+        # =================================
+        # Binary truncation
+        # ex: v1 = v4 & 0xFFFF
+        # =================================
+        if is_binary_truncation(rhs):
+            var_indexes = get_all_vars_in_node(lhs)
+            # TODO: Refine this algorithm
+            v_idx = var_indexes[0]
+
+            return set([v_idx])
+
+        # ===========================
+        # Something simple as v1 = 0
+        # ===========================
+        if is_var(lhs) and is_number(rhs):
             v_idx = lhs.v.idx
             constrained_var_idxs.add(v_idx)
 
@@ -2605,20 +2654,6 @@ def does_constrain(node):
                     node.ea, expr_ctype[cond.op]))
 
         return constrained_var_idxs
-
-    # =================================
-    # Binary truncation
-    # ex: v1 = v4 & 0xFFFF
-    # =================================
-    if is_asg(node):
-        rhs = node.y
-        lhs = node.x
-        if is_binary_truncation(rhs):
-            var_indexes = get_all_vars_in_node(lhs)
-            # TODO: Refine this algorithm
-            v_idx = var_indexes[0]
-
-            return set([v_idx])
 
     # TODO: More constraining cases here
 
